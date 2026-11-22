@@ -38,3 +38,14 @@ jobs:
         node-version: ${{ matrix.node-version }}
     - run: npm ci
     - run: npm run sync || exit 1
+
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - uses: actions/checkout@v4
+    - name: Verify keepalive behavior
+      run: bash .github/scripts/keepalive.test.sh
+    - name: Keep scheduled imports active
+      run: bash .github/scripts/keepalive.sh
