@@ -5,6 +5,11 @@ name: sync-rss
 
 on:
   workflow_dispatch: # manual trigger
+    inputs:
+      probe_export:
+        description: Check access to historical movie lists without importing
+        type: boolean
+        default: false
   schedule:
     # https://docs.github.com/en/actions/reference/events-that-trigger-workflows#scheduled-events
     # Runs every 6 hours
@@ -37,9 +42,14 @@ jobs:
       with:
         node-version: ${{ matrix.node-version }}
     - run: npm ci
+    - name: Check public history export access
+      if: inputs.probe_export
+      run: node scripts/probe-history.mjs
     - run: npm run sync || exit 1
+      if: ${{ !inputs.probe_export }}
 
   keepalive:
+    if: ${{ !inputs.probe_export }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
