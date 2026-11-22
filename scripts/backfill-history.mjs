@@ -57,6 +57,7 @@ async function exportShelf(user, shelf) {
       fs.writeFileSync(`history-export/${shelf}-parse-error.html`, html);
       throw error;
     }
+    if (page.rows.length < 30 && page.next) fs.writeFileSync(`history-export/${shelf}-short-page.html`, html);
     expected ??= page.count;
     assert(page.count === expected, 'Movie collection changed during export');
     rows.push(...page.rows);
@@ -64,6 +65,7 @@ async function exportShelf(user, shelf) {
     url = page.next;
     if (url) await sleep(1500);
   }
+  fs.writeFileSync(`history-export/${shelf}-export.json`, JSON.stringify(rows, null, 2));
   assert(rows.length === expected && new Set(rows.map(row => row.id)).size === expected, 'Incomplete movie export');
   return rows;
 }
