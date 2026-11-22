@@ -24,10 +24,16 @@ export function parsePage(html, shelf, pageUrl) {
       tags: (el.querySelector('.tags')?.textContent || '').replace(/^\s*标签[:：]\s*/, '').trim().split(/\s+/).filter(Boolean),
     };
   });
+  const range = doc.querySelector('.subject-num')?.textContent.match(/(\d+)-(\d+)\s*\/\s*(\d+)/);
+  assert(range && Number(range[3]) === count, 'Missing collection page range');
+  const start = Number(range[1]);
+  const end = Number(range[2]);
+  const slots = count ? end - start + 1 : 0;
+  assert(slots >= rows.length && slots >= 0, 'Invalid collection page range');
   const next = doc.querySelector('.paginator span.next a')?.getAttribute('href');
   const nextUrl = next ? new URL(next, pageUrl) : null;
   if (nextUrl) assert(nextUrl.origin === 'https://movie.douban.com', 'Unexpected pagination origin');
-  return { count, rows, next: nextUrl?.href };
+  return { count, rows, start, end, slots, next: nextUrl?.href };
 }
 
 export function csvCell(value) {
@@ -47,6 +53,8 @@ async function exportShelf(user, shelf) {
   const visited = new Set();
   const rows = [];
   let expected;
+  let lastEnd = 0;
+  let unavailable = 0;
   while (url) {
     assert(!visited.has(url), 'Repeated movie collection page');
     visited.add(url);
@@ -60,14 +68,18 @@ async function exportShelf(user, shelf) {
     if (page.rows.length < 30 && page.next) fs.writeFileSync(`history-export/${shelf}-short-page.html`, html);
     expected ??= page.count;
     assert(page.count === expected, 'Movie collection changed during export');
+    assert(page.start === lastEnd + 1 || page.count === 0, 'Non-contiguous collection pages');
+    lastEnd = page.end;
+    unavailable += page.slots - page.rows.length;
     rows.push(...page.rows);
     console.log(`${shelf}: exported ${rows.length}/${expected}`);
     url = page.next;
     if (url) await sleep(1500);
   }
   fs.writeFileSync(`history-export/${shelf}-export.json`, JSON.stringify(rows, null, 2));
-  assert(rows.length === expected && new Set(rows.map(row => row.id)).size === expected, 'Incomplete movie export');
-  return rows;
+  assert(lastEnd === expected && rows.length + unavailable === expected && new Set(rows.map(row => row.id)).size === rows.length, 'Incomplete movie export');
+  console.log(`${shelf}: ${rows.length} readable marks; ${unavailable} slots not returned by Douban`);
+  return { shelf, rows, listed: expected, unavailable };
 }
 
 async function fetchMarks(api) {
@@ -89,11 +101,32 @@ async function fetchMarks(api) {
   return marks;
 }
 
+export async function importMissingMark(api, row) {
+  let item;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    item = await api.get('catalog/fetch', { searchParams: { url: row.link } }).json();
+    if (item.uuid) break;
+    await sleep(1500);
+  }
+  assert(item.uuid && ['movie', 'tv'].includes(item.category), 'Movie/TV catalog lookup did not finish');
+  const response = await api.get(`me/shelf/item/${item.uuid}`, { throwHttpErrors: false });
+  if (response.statusCode === 200) {
+    return null;
+  }
+  assert(response.statusCode === 404, `Cannot check existing mark: HTTP ${response.statusCode}`);
+  await api.post(`me/shelf/item/${item.uuid}`, { json: {
+    shelf_type: row.status, visibility: 2, comment_text: row.comment, rating_grade: row.rating,
+    tags: row.tags, created_time: `${row.date}T00:00:00+08:00`, post_to_fediverse: false,
+  } });
+  return { ...row, category: item.category, uuid: item.uuid };
+}
+
 async function main() {
   assert(process.env.DOUBAN_USER_ID && process.env.NEODB_API_TOKEN, 'Douban and NeoDB account configuration is required');
   const apply = process.env.BACKFILL_APPLY === 'true';
   fs.mkdirSync('history-export', { recursive: true });
-  const rows = [...await exportShelf(process.env.DOUBAN_USER_ID, 'collect'), ...await exportShelf(process.env.DOUBAN_USER_ID, 'wish')];
+  const shelves = [await exportShelf(process.env.DOUBAN_USER_ID, 'collect'), await exportShelf(process.env.DOUBAN_USER_ID, 'wish')];
+  const rows = shelves.flatMap(shelf => shelf.rows);
   assert(new Set(rows.map(row => row.id)).size === rows.length, 'Conflicting marks across Douban shelves');
   fs.writeFileSync('history-export/douban-movies.json', JSON.stringify(rows, null, 2));
   const header = ['标题', '豆瓣链接', '状态', '标记日期', '评分（10分）', '短评', '标签'];
@@ -104,28 +137,13 @@ async function main() {
   const missing = missingMarks(rows, existing);
   fs.writeFileSync('history-export/missing-marks.json', JSON.stringify(missing, null, 2));
   console.log(`Exported ${rows.length}; missing from NeoDB by Douban link: ${missing.length}; apply: ${apply}`);
-  const report = { exported: rows.length, candidates: missing.length, inserted: [], skipped: [], failed: [] };
+  const report = { exported: rows.length, shelves: shelves.map(({ rows, ...summary }) => summary), candidates: missing.length, inserted: [], skipped: [], failed: [] };
   if (apply) {
     for (const row of missing) {
       try {
-        let item;
-        for (let attempt = 0; attempt < 5; attempt++) {
-          item = await api.get('catalog/fetch', { searchParams: { url: row.link } }).json();
-          if (item.uuid) break;
-          await sleep(1500);
-        }
-        assert(item.uuid && ['movie', 'tv'].includes(item.category), 'Movie/TV catalog lookup did not finish');
-        const response = await api.get(`me/shelf/item/${item.uuid}`, { throwHttpErrors: false });
-        if (response.statusCode === 200) {
-          report.skipped.push(row);
-          continue;
-        }
-        assert(response.statusCode === 404, `Cannot check existing mark: HTTP ${response.statusCode}`);
-        await api.post(`me/shelf/item/${item.uuid}`, { json: {
-          shelf_type: row.status, visibility: 2, comment_text: row.comment, rating_grade: row.rating,
-          tags: row.tags, created_time: `${row.date}T00:00:00+08:00`, post_to_fediverse: false,
-        } });
-        report.inserted.push({ ...row, category: item.category, uuid: item.uuid });
+        const inserted = await importMissingMark(api, row);
+        if (!inserted) { report.skipped.push(row); continue; }
+        report.inserted.push(inserted);
         console.log(`Inserted ${row.status}: ${row.title}`);
       } catch (error) {
         report.failed.push({ ...row, error: error.message });
