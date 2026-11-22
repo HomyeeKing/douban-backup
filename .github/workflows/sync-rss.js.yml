@@ -7,7 +7,11 @@ on:
   workflow_dispatch: # manual trigger
     inputs:
       probe_export:
-        description: Check access to historical movie lists without importing
+        description: Export full movie history; import only when apply is enabled
+        type: boolean
+        default: false
+      apply:
+        description: Insert missing historical marks into NeoDB
         type: boolean
         default: false
   schedule:
@@ -42,9 +46,21 @@ jobs:
       with:
         node-version: ${{ matrix.node-version }}
     - run: npm ci
-    - name: Check public history export access
+    - name: Verify history parser and merge behavior
       if: inputs.probe_export
-      run: node scripts/probe-history.mjs
+      run: node --test scripts/backfill-history.test.mjs
+    - name: Export and backfill movie history
+      if: inputs.probe_export
+      env:
+        BACKFILL_APPLY: ${{ inputs.apply }}
+      run: node scripts/backfill-history.mjs
+    - name: Save history export and import report
+      if: ${{ always() && inputs.probe_export }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: douban-history
+        path: history-export/
+        retention-days: 7
     - run: npm run sync || exit 1
       if: ${{ !inputs.probe_export }}
 
